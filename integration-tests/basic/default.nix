@@ -171,7 +171,7 @@ in {
           settings = {
             listen = "[::]:8080";
 
-            jwt = { };
+            jwt.blacklist.subjects = [ "alice" ];
 
             chunking = {
               nar-size-threshold = 1;
@@ -205,10 +205,12 @@ in {
 
       root_token = server.succeed("${cmd.atticadm} make-token --sub 'e2e-root' --validity '1 month' --push '*' --pull '*' --delete '*' --create-cache '*' --destroy-cache '*' --configure-cache '*' --configure-cache-retention '*' </dev/null").strip()
       readonly_token = server.succeed("${cmd.atticadm} make-token --sub 'e2e-root' --validity '1 month' --pull 'test' </dev/null").strip()
+      blacklisted_token = server.succeed("${cmd.atticadm} make-token --sub 'alice' --validity '1 month' --push '*' --pull '*' --create-cache '*' </dev/null").strip()
 
       client.succeed(f"attic login --set-default root http://server:8080 {root_token}")
       client.succeed(f"attic login readonly http://server:8080 {readonly_token}")
       client.succeed("attic login anon http://server:8080")
+      client.succeed(f"attic login blacklisted http://server:8080 {blacklisted_token}")
 
       # TODO: Make sure the correct status codes are returned
       # (i.e., 500s shouldn't pass the "should fail" tests)
@@ -229,6 +231,14 @@ in {
           client.succeed("attic use readonly:test")
           client.succeed(f"nix-store -r {test_file}")
           client.succeed(f"grep hello {test_file}")
+
+      with subtest("Check that token with blacklisted subject is rejected"):
+          client.succeed("attic cache info test")
+          client.fail("attic cache create blacklisted:test-blacklist")
+          client.fail(f"attic push blacklisted:test {test_file}")
+          client.fail("attic use blacklisted:test")
+          status = client.succeed(f"curl -s -o /dev/null -w '%{{http_code}}' -H 'Authorization: Bearer {blacklisted_token}' http://server:8080/test/nix-cache-info")
+          assert status == "401", f"Expected revoked token to lose access to private cache, got {status}"
 
       with subtest("Check that we cannot push without required permissions"):
           client.fail(f"attic push readonly:test {test_file}")
