@@ -1,16 +1,16 @@
 pub mod entity;
 pub mod migration;
 
+use std::future::Future;
 use std::ops::Deref;
 
 use anyhow::anyhow;
-use async_trait::async_trait;
 use chrono::Utc;
-use sea_orm::entity::prelude::*;
 use sea_orm::entity::Iterable as EnumIterable;
+use sea_orm::entity::prelude::*;
 use sea_orm::query::{JoinType, QueryOrder, QuerySelect, QueryTrait};
 use sea_orm::sea_query::{Expr, LockBehavior, LockType, Query, Value};
-use sea_orm::{ActiveValue::Set, ConnectionTrait, DatabaseConnection, FromQueryResult};
+use sea_orm::{ActiveValue::Set, ConnectionTrait, DatabaseConnection, ExprTrait, FromQueryResult};
 use tokio::task;
 
 use crate::error::{ErrorKind, ServerError, ServerResult};
@@ -31,32 +31,42 @@ const SELECT_NAR: &str = "N_";
 const SELECT_CHUNK: &str = "CH_";
 const SELECT_CHUNKREF: &str = "CHR_";
 
-#[async_trait]
 pub trait AtticDatabase: Send + Sync {
     /// Retrieves an object in a binary cache by its store path hash, returning all its
     /// chunks.
-    async fn find_object_and_chunks_by_store_path_hash(
+    fn find_object_and_chunks_by_store_path_hash(
         &self,
         cache: &CacheName,
         store_path_hash: &StorePathHash,
         include_chunks: bool,
-    ) -> ServerResult<(ObjectModel, CacheModel, NarModel, Vec<Option<ChunkModel>>)>;
+    ) -> impl Future<
+        Output = ServerResult<(ObjectModel, CacheModel, NarModel, Vec<Option<ChunkModel>>)>,
+    > + Send;
 
     /// Retrieves a binary cache.
-    async fn find_cache(&self, cache: &CacheName) -> ServerResult<CacheModel>;
+    fn find_cache(
+        &self,
+        cache: &CacheName,
+    ) -> impl Future<Output = ServerResult<CacheModel>> + Send;
 
     /// Retrieves and locks a valid NAR matching a NAR Hash.
-    async fn find_and_lock_nar(&self, nar_hash: &Hash) -> ServerResult<Option<NarGuard>>;
+    fn find_and_lock_nar(
+        &self,
+        nar_hash: &Hash,
+    ) -> impl Future<Output = ServerResult<Option<NarGuard>>> + Send;
 
     /// Retrieves and locks a valid chunk matching a chunk Hash.
-    async fn find_and_lock_chunk(
+    fn find_and_lock_chunk(
         &self,
         chunk_hash: &Hash,
         compression: Compression,
-    ) -> ServerResult<Option<ChunkGuard>>;
+    ) -> impl Future<Output = ServerResult<Option<ChunkGuard>>> + Send;
 
     /// Bumps the last accessed timestamp of an object.
-    async fn bump_object_last_accessed(&self, object_id: i64) -> ServerResult<()>;
+    fn bump_object_last_accessed(
+        &self,
+        object_id: i64,
+    ) -> impl Future<Output = ServerResult<()>> + Send;
 }
 
 pub struct NarGuard {
@@ -103,10 +113,7 @@ pub fn build_cache_object_nar_query(include_chunks: bool) -> Select<Object> {
 
         If any element in the chunk `Vec` is `None`, it means the chunk is missing
         for some reason (e.g., corrupted) and the full NAR cannot be reconstructed.
-        In such cases, .narinfo/.nar requests will return HTTP 503 and the affected
-        store paths will be treated as non-existent in `get-missing-paths` so they
-        can be repaired automatically when any client upload a path containing the
-        missing chunk.
+        In such cases, .narinfo/.nar requests will return HTTP 503.
 
         It's a quintuple join and the query plans look reasonable on SQLite
         and Postgres. For each .narinfo/.nar request, we only submit a single query.
@@ -133,7 +140,6 @@ pub fn build_cache_object_nar_query(include_chunks: bool) -> Select<Object> {
     query
 }
 
-#[async_trait]
 impl AtticDatabase for DatabaseConnection {
     async fn find_object_and_chunks_by_store_path_hash(
         &self,
@@ -157,7 +163,7 @@ impl AtticDatabase for DatabaseConnection {
 
         let stmt = query.build(self.get_database_backend());
         let results = self
-            .query_all(stmt)
+            .query_all_raw(stmt)
             .await
             .map_err(ServerError::database_error)?;
 
@@ -348,7 +354,7 @@ impl Drop for NarGuard {
                 .to_owned();
             let stmt = database.get_database_backend().build(&decr_holders);
 
-            if let Err(e) = database.execute(stmt).await {
+            if let Err(e) = database.execute_raw(stmt).await {
                 tracing::warn!("Failed to decrement holders count: {}", e);
             }
         });
@@ -388,7 +394,7 @@ impl Drop for ChunkGuard {
                 .to_owned();
             let stmt = database.get_database_backend().build(&decr_holders);
 
-            if let Err(e) = database.execute(stmt).await {
+            if let Err(e) = database.execute_raw(stmt).await {
                 tracing::warn!("Failed to decrement holders count: {}", e);
             }
         });

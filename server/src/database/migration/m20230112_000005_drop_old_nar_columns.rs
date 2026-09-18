@@ -22,7 +22,7 @@ impl MigrationTrait for Migration {
             // Just copy all data to a new table
             manager
                 .get_connection()
-                .execute(Statement::from_string(
+                .execute_raw(Statement::from_string(
                     manager.get_database_backend(),
                     "PRAGMA foreign_keys = OFF".to_owned(),
                 ))
@@ -94,7 +94,7 @@ impl MigrationTrait for Migration {
                 .to_owned();
 
             let insertion_stmt = manager.get_database_backend().build(&insertion);
-            manager.get_connection().execute(insertion_stmt).await?;
+            manager.get_connection().execute_raw(insertion_stmt).await?;
 
             manager
                 .drop_table(Table::drop().table(nar::Entity).to_owned())
@@ -110,48 +110,22 @@ impl MigrationTrait for Migration {
 
             manager
                 .get_connection()
-                .execute(Statement::from_string(
+                .execute_raw(Statement::from_string(
                     manager.get_database_backend(),
                     "PRAGMA foreign_keys = ON".to_owned(),
                 ))
                 .await?;
         } else {
-            // Just drop the columns
-            manager
-                .alter_table(
-                    Table::alter()
-                        .table(nar::Entity)
-                        .drop_column(Alias::new("file_hash"))
-                        .to_owned(),
-                )
-                .await?;
-
-            manager
-                .alter_table(
-                    Table::alter()
-                        .table(nar::Entity)
-                        .drop_column(Alias::new("file_size"))
-                        .to_owned(),
-                )
-                .await?;
-
-            manager
-                .alter_table(
-                    Table::alter()
-                        .table(nar::Entity)
-                        .drop_column(Alias::new("remote_file"))
-                        .to_owned(),
-                )
-                .await?;
-
-            manager
-                .alter_table(
-                    Table::alter()
-                        .table(nar::Entity)
-                        .drop_column(Alias::new("remote_file_id"))
-                        .to_owned(),
-                )
-                .await?;
+            for column in ["file_hash", "file_size", "remote_file", "remote_file_id"] {
+                manager
+                    .alter_table(
+                        Table::alter()
+                            .table(nar::Entity)
+                            .drop_column(Alias::new(column))
+                            .to_owned(),
+                    )
+                    .await?;
+            }
         }
 
         Ok(())

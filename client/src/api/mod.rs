@@ -10,8 +10,8 @@ use futures::{
     stream::{self, StreamExt, TryStream, TryStreamExt},
 };
 use reqwest::{
-    header::{HeaderMap, HeaderValue, AUTHORIZATION, USER_AGENT},
     Body, Client as HttpClient, Response, StatusCode, Url,
+    header::{AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT},
 };
 use serde::Deserialize;
 
@@ -20,7 +20,7 @@ use crate::version::ATTIC_DISTRIBUTOR;
 use attic::api::v1::cache_config::{CacheConfig, CreateCacheRequest};
 use attic::api::v1::get_missing_paths::{GetMissingPathsRequest, GetMissingPathsResponse};
 use attic::api::v1::upload_path::{
-    UploadPathNarInfo, UploadPathResult, ATTIC_NAR_INFO, ATTIC_NAR_INFO_PREAMBLE_SIZE,
+    ATTIC_NAR_INFO, ATTIC_NAR_INFO_PREAMBLE_SIZE, UploadPathNarInfo, UploadPathResult,
 };
 use attic::cache::CacheName;
 use attic::nix_store::StorePathHash;
@@ -182,10 +182,7 @@ impl ApiClient {
         let endpoint = self.endpoint.join("_api/v1/upload-path")?;
         let upload_info_json = serde_json::to_string(&nar_info)?;
 
-        let mut req = self
-            .client
-            .put(endpoint)
-            .header(USER_AGENT, HeaderValue::from_str(ATTIC_USER_AGENT)?);
+        let mut req = self.client.put(endpoint);
 
         if force_preamble || upload_info_json.len() >= NAR_INFO_PREAMBLE_THRESHOLD {
             let preamble = Bytes::from(upload_info_json);
@@ -237,6 +234,8 @@ impl fmt::Display for StructuredApiError {
 
 fn build_http_client(token: Option<&str>) -> HttpClient {
     let mut headers = HeaderMap::new();
+
+    headers.insert(USER_AGENT, HeaderValue::from_str(ATTIC_USER_AGENT).unwrap());
 
     if let Some(token) = token {
         let auth_header = HeaderValue::from_str(&format!("bearer {}", token)).unwrap();

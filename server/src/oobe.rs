@@ -12,12 +12,12 @@
 //! - NARs: `~/.local/share/attic/storage`
 
 use anyhow::Result;
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{Months, Utc};
 use rsa::pkcs1::EncodeRsaPrivateKey;
 use tokio::fs::{self, OpenOptions};
 
-use crate::access::{decode_token_rs256_secret_base64, SignatureType, Token};
+use crate::access::{SignatureType, Token, decode_token_rs256_secret_base64};
 use crate::config;
 use attic::cache::CacheNamePattern;
 
@@ -37,6 +37,7 @@ pub async fn run_oobe() -> Result<()> {
     let database_url = format!("sqlite://{}", database_path.to_str().unwrap());
     OpenOptions::new()
         .create(true)
+        .truncate(false)
         .write(true)
         .open(&database_path)
         .await?;
@@ -45,7 +46,7 @@ pub async fn run_oobe() -> Result<()> {
     fs::create_dir_all(&storage_path).await?;
 
     let rs256_secret_base64 = {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let private_key = rsa::RsaPrivateKey::new(&mut rng, 4096)?;
         let pkcs1_pem = private_key.to_pkcs1_pem(rsa::pkcs1::LineEnding::LF)?;
 
@@ -74,7 +75,7 @@ pub async fn run_oobe() -> Result<()> {
         perm.destroy_cache = true;
 
         let key = decode_token_rs256_secret_base64(&rs256_secret_base64).unwrap();
-        token.encode(&SignatureType::RS256(key), &None, &None)?
+        token.encode(&SignatureType::RS256(Box::new(key)), &None, &None)?
     };
 
     eprintln!();
