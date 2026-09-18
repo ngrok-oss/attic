@@ -5,8 +5,8 @@ use std::marker::Unpin;
 use std::sync::Arc;
 
 use anyhow::anyhow;
-use async_compression::tokio::bufread::{BrotliEncoder, XzEncoder, ZstdEncoder};
 use async_compression::Level as CompressionLevel;
+use async_compression::tokio::bufread::{BrotliEncoder, XzEncoder, ZstdEncoder};
 use axum::{
     body::Body,
     extract::{Extension, Json},
@@ -14,11 +14,10 @@ use axum::{
 };
 use bytes::{Bytes, BytesMut};
 use chrono::Utc;
-use futures::future::join_all;
 use futures::StreamExt;
-use sea_orm::entity::prelude::*;
-use sea_orm::sea_query::Expr;
+use futures::future::join_all;
 use sea_orm::ActiveValue::Set;
+use sea_orm::entity::prelude::*;
 use sea_orm::{QuerySelect, TransactionTrait};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufRead, AsyncReadExt};
@@ -32,22 +31,23 @@ use crate::compression::{CompressionStream, CompressorFn};
 use crate::config::CompressionType;
 use crate::error::{ErrorKind, ServerError, ServerResult};
 use crate::narinfo::Compression;
+use crate::storage::StorageBackend;
 use crate::{RequestState, State};
 use attic::api::v1::upload_path::{
-    UploadPathNarInfo, UploadPathResult, UploadPathResultKind, ATTIC_NAR_INFO,
-    ATTIC_NAR_INFO_PREAMBLE_SIZE,
+    ATTIC_NAR_INFO, ATTIC_NAR_INFO_PREAMBLE_SIZE, UploadPathNarInfo, UploadPathResult,
+    UploadPathResultKind,
 };
 use attic::chunking::chunk_stream;
 use attic::hash::Hash;
-use attic::io::{read_chunk_async, HashReader};
+use attic::io::{HashReader, read_chunk_async};
 use attic::util::Finally;
 
+use crate::database::entity::Json as DbJson;
 use crate::database::entity::cache;
 use crate::database::entity::chunk::{self, ChunkState, Entity as Chunk};
 use crate::database::entity::chunkref::{self, Entity as ChunkRef};
 use crate::database::entity::nar::{self, Entity as Nar, NarState};
 use crate::database::entity::object::{self, Entity as Object, InsertExt};
-use crate::database::entity::Json as DbJson;
 use crate::database::{AtticDatabase, ChunkGuard, NarGuard};
 
 /// Number of chunks to upload to the storage backend at once.
@@ -90,9 +90,8 @@ pub(crate) async fn upload_path(
     body: Body,
 ) -> ServerResult<Json<UploadPathResult>> {
     let stream = body.into_data_stream();
-    let mut stream = StreamReader::new(
-        stream.map(|r| r.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))),
-    );
+    let mut stream =
+        StreamReader::new(stream.map(|r| r.map_err(|e| io::Error::other(e.to_string()))));
 
     let upload_info: UploadPathNarInfo = {
         if let Some(preamble_size_bytes) = headers.get(ATTIC_NAR_INFO_PREAMBLE_SIZE) {
@@ -153,6 +152,7 @@ pub(crate) async fn upload_path(
     // Try to acquire a lock on an existing NAR
     if let Some(existing_nar) = database.find_and_lock_nar(&upload_info.nar_hash).await? {
         // Deduplicate?
+        // TODO: Fully kill chunk recovery (no more missing chunks)
         let missing_chunk = ChunkRef::find()
             .filter(chunkref::Column::NarId.eq(existing_nar.id))
             .filter(chunkref::Column::ChunkId.is_null())
@@ -176,7 +176,6 @@ pub(crate) async fn upload_path(
         }
     }
 
-    // New NAR or need to repair
     upload_path_new(username, cache, upload_info, stream, database, &state).await
 }
 
@@ -198,7 +197,7 @@ async fn upload_path_dedup(
 
         // FIXME: errors
         let (nar_hash, nar_size) = nar_compute.get().unwrap();
-        let nar_hash = Hash::Sha256(nar_hash.as_slice().try_into().unwrap());
+        let nar_hash = Hash::Sha256((&nar_hash[..]).try_into().unwrap());
 
         // Confirm that the NAR Hash and Size are correct
         if nar_hash.to_typed_base16() != existing_nar.nar_hash
@@ -210,10 +209,6 @@ async fn upload_path_dedup(
     }
 
     // Finally...
-    let txn = database
-        .begin()
-        .await
-        .map_err(ServerError::database_error)?;
 
     // Create a mapping granting the local cache access to the NAR
     Object::insert({
@@ -225,26 +220,9 @@ async fn upload_path_dedup(
         new_object
     })
     .on_conflict_do_update()
-    .exec(&txn)
+    .exec(database)
     .await
     .map_err(ServerError::database_error)?;
-
-    // Also mark the NAR as complete again
-    //
-    // This is racy (a chunkref might have been broken in the
-    // meantime), but it's okay since it's just a hint to
-    // `get-missing-paths` so clients don't attempt to upload
-    // again. Also see the comments in `server/src/database/entity/nar.rs`.
-    Nar::update(nar::ActiveModel {
-        id: Set(existing_nar.id),
-        completeness_hint: Set(true),
-        ..Default::default()
-    })
-    .exec(&txn)
-    .await
-    .map_err(ServerError::database_error)?;
-
-    txn.commit().await.map_err(ServerError::database_error)?;
 
     // Ensure it's not unlocked earlier
     drop(existing_nar);
@@ -377,8 +355,6 @@ async fn upload_path_new_chunked(
                     nar_id: Set(nar_id),
                     seq: Set(chunk_idx),
                     chunk_id: Set(Some(chunk.guard.id)),
-                    chunk_hash: Set(chunk.guard.chunk_hash.clone()),
-                    compression: Set(chunk.guard.compression.clone()),
                     ..Default::default()
                 })
                 .exec(&database)
@@ -396,7 +372,7 @@ async fn upload_path_new_chunked(
     // Confirm that the NAR Hash and Size are correct
     // FIXME: errors
     let (nar_hash, nar_size) = nar_compute.get().unwrap();
-    let nar_hash = Hash::Sha256(nar_hash.as_slice().try_into().unwrap());
+    let nar_hash = Hash::Sha256((&nar_hash[..]).try_into().unwrap());
 
     if nar_hash != upload_info.nar_hash || *nar_size != upload_info.nar_size {
         return Err(ErrorKind::RequestError(anyhow!("Bad NAR Hash or Size")).into());
@@ -534,8 +510,6 @@ async fn upload_path_new_unchunked(
         nar_id: Set(nar_id),
         seq: Set(0),
         chunk_id: Set(Some(chunk.guard.id)),
-        chunk_hash: Set(upload_info.nar_hash.to_typed_base16()),
-        compression: Set(compression.to_string()),
         ..Default::default()
     })
     .exec(&txn)
@@ -596,7 +570,7 @@ async fn upload_chunk(
 
             // FIXME: errors
             let (nar_hash, nar_size) = nar_compute.get().unwrap();
-            let nar_hash = Hash::Sha256(nar_hash.as_slice().try_into().unwrap());
+            let nar_hash = Hash::Sha256((&nar_hash[..]).try_into().unwrap());
 
             // Confirm that the NAR Hash and Size are correct
             if nar_hash.to_typed_base16() != existing_chunk.chunk_hash
@@ -680,18 +654,14 @@ async fn upload_chunk(
     let (chunk_hash, chunk_size) = stream.nar_hash_and_size().unwrap();
     let (file_hash, file_size) = stream.file_hash_and_size().unwrap();
 
-    let chunk_hash = Hash::Sha256(chunk_hash.as_slice().try_into().unwrap());
-    let file_hash = Hash::Sha256(file_hash.as_slice().try_into().unwrap());
+    let chunk_hash = Hash::Sha256((&chunk_hash[..]).try_into().unwrap());
+    let file_hash = Hash::Sha256((&file_hash[..]).try_into().unwrap());
 
     if chunk_hash != given_chunk_hash || *chunk_size != given_chunk_size {
         return Err(ErrorKind::RequestError(anyhow!("Bad chunk hash or size")).into());
     }
 
     // Finally...
-    let txn = database
-        .begin()
-        .await
-        .map_err(ServerError::database_error)?;
 
     // Update the file hash and size, and set the chunk to valid
     let file_size_db = i64::try_from(*file_size).map_err(ServerError::request_error)?;
@@ -703,25 +673,11 @@ async fn upload_chunk(
         holders_count: Set(1),
         ..Default::default()
     })
-    .exec(&txn)
+    .exec(&database)
     .await
     .map_err(ServerError::database_error)?;
 
-    // Also repair broken chunk references pointing at the same chunk
-    let repaired = ChunkRef::update_many()
-        .col_expr(chunkref::Column::ChunkId, Expr::value(chunk_id))
-        .filter(chunkref::Column::ChunkId.is_null())
-        .filter(chunkref::Column::ChunkHash.eq(chunk_hash.to_typed_base16()))
-        .filter(chunkref::Column::Compression.eq(compression.to_string()))
-        .exec(&txn)
-        .await
-        .map_err(ServerError::database_error)?;
-
-    txn.commit().await.map_err(ServerError::database_error)?;
-
     cleanup.cancel();
-
-    tracing::debug!("Repaired {} chunkrefs", repaired.rows_affected);
 
     let guard = ChunkGuard::from_locked(database.clone(), chunk);
 
@@ -754,7 +710,7 @@ impl ChunkData {
                 let mut hasher = Sha256::new();
                 hasher.update(bytes);
                 let hash = hasher.finalize();
-                Hash::Sha256(hash.as_slice().try_into().unwrap())
+                Hash::Sha256((&hash[..]).try_into().unwrap())
             }
             Self::Stream(_, hash, _) => hash.clone(),
         }

@@ -84,21 +84,26 @@ let
 
   storageModules = {
     local = {};
-    minio = let
-      accessKey = "legit";
-      secretKey = "111-1111111";
+    garage = let
+      accessKey = "GKaaaaaaaaaaaaaaaaaaaaaaaa";
+      secretKey = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     in {
       server = {
-        services.minio = {
+        services.garage = {
           enable = true;
-          rootCredentialsFile = "/etc/minio.env";
-        };
+          package = pkgs.garage_2;
+          settings = {
+            rpc_bind_addr = "127.0.0.1:3901";
+            rpc_public_addr = "127.0.0.1:3901";
+            rpc_secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            replication_factor = 1;
 
-        # For testing only - Don't actually do this
-        environment.etc."minio.env".text = ''
-          MINIO_ROOT_USER=${accessKey}
-          MINIO_ROOT_PASSWORD=${secretKey}
-        '';
+            s3_api = {
+              s3_region = "garage";
+              api_bind_addr = "0.0.0.0:9000";
+            };
+          };
+        };
 
         networking.firewall.allowedTCPPorts = [ 9000 ];
 
@@ -106,7 +111,7 @@ let
           storage = {
             type = "s3";
             endpoint = "http://server:9000";
-            region = "us-east-1";
+            region = "garage";
             bucket = "attic";
             credentials = {
               access_key_id = accessKey;
@@ -116,9 +121,19 @@ let
         };
       };
       testScript = ''
-        server.succeed("mkdir /var/lib/minio/data/attic")
-        server.succeed("chown minio: /var/lib/minio/data/attic")
-        client.wait_until_succeeds("curl http://server:9000", timeout=20)
+        server.wait_for_unit("garage.service")
+        server.wait_for_open_port(3901)
+        garage_node_id = server.succeed("garage status | tail -n1 | awk '{ print $1 }'")
+        server.succeed(
+            f"garage layout assign -c 100MB -z garage {garage_node_id}",
+            "garage layout apply --version 1",
+            "garage key import ${accessKey} ${secretKey} --yes",
+            "garage bucket create attic",
+            "garage bucket allow --read --write --owner attic --key ${accessKey}"
+        )
+
+        server.wait_for_unit("atticd.service")
+        server.wait_for_open_port(9000)
       '';
     };
   };
@@ -129,7 +144,7 @@ in {
       default = "sqlite";
     };
     storage = lib.mkOption {
-      type = types.enum [ "local" "minio" ];
+      type = types.enum [ "local" "garage" ];
       default = "local";
     };
   };
@@ -156,7 +171,7 @@ in {
           settings = {
             listen = "[::]:8080";
 
-            jwt = { };
+            jwt.blacklist.subjects = [ "alice" ];
 
             chunking = {
               nar-size-threshold = 1;
@@ -190,10 +205,12 @@ in {
 
       root_token = server.succeed("${cmd.atticadm} make-token --sub 'e2e-root' --validity '1 month' --push '*' --pull '*' --delete '*' --create-cache '*' --destroy-cache '*' --configure-cache '*' --configure-cache-retention '*' </dev/null").strip()
       readonly_token = server.succeed("${cmd.atticadm} make-token --sub 'e2e-root' --validity '1 month' --pull 'test' </dev/null").strip()
+      blacklisted_token = server.succeed("${cmd.atticadm} make-token --sub 'alice' --validity '1 month' --push '*' --pull '*' --create-cache '*' </dev/null").strip()
 
       client.succeed(f"attic login --set-default root http://server:8080 {root_token}")
       client.succeed(f"attic login readonly http://server:8080 {readonly_token}")
       client.succeed("attic login anon http://server:8080")
+      client.succeed(f"attic login blacklisted http://server:8080 {blacklisted_token}")
 
       # TODO: Make sure the correct status codes are returned
       # (i.e., 500s shouldn't pass the "should fail" tests)
@@ -214,6 +231,14 @@ in {
           client.succeed("attic use readonly:test")
           client.succeed(f"nix-store -r {test_file}")
           client.succeed(f"grep hello {test_file}")
+
+      with subtest("Check that token with blacklisted subject is rejected"):
+          client.succeed("attic cache info test")
+          client.fail("attic cache create blacklisted:test-blacklist")
+          client.fail(f"attic push blacklisted:test {test_file}")
+          client.fail("attic use blacklisted:test")
+          status = client.succeed(f"curl -s -o /dev/null -w '%{{http_code}}' -H 'Authorization: Bearer {blacklisted_token}' http://server:8080/test/nix-cache-info")
+          assert status == "401", f"Expected revoked token to lose access to private cache, got {status}"
 
       with subtest("Check that we cannot push without required permissions"):
           client.fail(f"attic push readonly:test {test_file}")

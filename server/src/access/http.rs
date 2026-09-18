@@ -7,7 +7,7 @@ use sea_orm::DatabaseConnection;
 use tokio::sync::OnceCell;
 
 use crate::access::{CachePermission, Token};
-use crate::database::{entity::cache::CacheModel, AtticDatabase};
+use crate::database::{AtticDatabase, entity::cache::CacheModel};
 use crate::error::ServerResult;
 use crate::{RequestState, State};
 
@@ -16,6 +16,12 @@ use crate::{RequestState, State};
 pub struct AuthState {
     /// The JWT token.
     pub token: OnceCell<Token>,
+}
+
+impl Default for AuthState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AuthState {
@@ -112,9 +118,22 @@ pub async fn apply_auth(req: Request, next: Next) -> Response {
 
             if let Err(e) = &res_token {
                 tracing::debug!("Ignoring bad JWT token: {}", e);
+                return None;
             }
 
-            res_token.ok()
+            let token = res_token.ok()?;
+
+            // Check if subject of the token is blacklisted
+            if let Some(blacklist) = &state.config.jwt.blacklist {
+                if let Some(subject) = token.sub() {
+                    if blacklist.subjects.contains(subject) {
+                        tracing::warn!("Rejecting token with blacklisted subject: {}", subject);
+                        return None;
+                    }
+                }
+            }
+
+            Some(token)
         });
 
     if let Some(token) = token {

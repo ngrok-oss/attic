@@ -5,31 +5,31 @@
 //! The implementation is based on the specifications at <https://github.com/fzakaria/nix-http-binary-cache-api-spec>.
 
 use std::collections::VecDeque;
-use std::io::{Error as IoError, ErrorKind as IoErrorKind};
+use std::io::Error as IoError;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::http;
 use axum::{
+    Router,
     body::Body,
     extract::{Extension, Path},
     http::StatusCode,
     response::{IntoResponse, Redirect, Response},
     routing::get,
-    Router,
 };
-use futures::stream::BoxStream;
 use futures::TryStreamExt as _;
+use futures::stream::BoxStream;
 use serde::Serialize;
 use tokio_util::io::ReaderStream;
 use tracing::instrument;
 
-use crate::database::entity::chunk::ChunkModel;
 use crate::database::AtticDatabase;
+use crate::database::entity::chunk::ChunkModel;
 use crate::error::{ErrorKind, ServerResult};
 use crate::narinfo::NarInfo;
 use crate::nix_manifest;
-use crate::storage::{Download, StorageBackend};
+use crate::storage::{Download, StorageBackend, StorageBackendImpl};
 use crate::{RequestState, State};
 use attic::cache::CacheName;
 use attic::io::merge_chunks;
@@ -203,6 +203,7 @@ async fn get_nar(
 
     req_state.set_public_cache(cache.is_public);
 
+    // TODO: Fully kill chunk recovery
     if chunks.iter().any(Option::is_none) {
         // at least one of the chunks is missing :(
         return Err(ErrorKind::IncompleteNar.into());
@@ -237,19 +238,16 @@ async fn get_nar(
     } else {
         // reassemble NAR
         fn io_error<E: std::error::Error + Send + Sync + 'static>(e: E) -> IoError {
-            IoError::new(IoErrorKind::Other, e)
+            IoError::other(e)
         }
 
-        let streamer = |chunk: ChunkModel, storage: Arc<Box<dyn StorageBackend + 'static>>| async move {
+        let streamer = |chunk: ChunkModel, storage: Arc<StorageBackendImpl>| async move {
             match storage
                 .download_file_db(&chunk.remote_file.0, true)
                 .await
                 .map_err(io_error)?
             {
-                Download::Url(_) => Err(IoError::new(
-                    IoErrorKind::Other,
-                    "URLs not supported for NAR reassembly",
-                )),
+                Download::Url(_) => Err(IoError::other("URLs not supported for NAR reassembly")),
                 Download::AsyncRead(stream) => {
                     let stream: BoxStream<_> = Box::pin(ReaderStream::new(stream));
                     Ok(stream)
@@ -281,7 +279,7 @@ async fn get_nar(
 
 pub fn get_router() -> Router {
     Router::new()
-        .route("/:cache/nix-cache-info", get(get_nix_cache_info))
-        .route("/:cache/:path", get(get_store_path_info))
-        .route("/:cache/nar/:path", get(get_nar))
+        .route("/{cache}/nix-cache-info", get(get_nix_cache_info))
+        .route("/{cache}/{path}", get(get_store_path_info))
+        .route("/{cache}/nar/{path}", get(get_nar))
 }

@@ -26,32 +26,34 @@ pub mod nix_manifest;
 pub mod oobe;
 mod storage;
 
-use std::future::IntoFuture;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
 use axum::{
-    extract::Extension,
-    http::{uri::Scheme, Uri},
     Router,
+    extract::Extension,
+    http::{Uri, uri::Scheme},
 };
-use sea_orm::{query::Statement, ConnectionTrait, Database, DatabaseConnection};
+use sea_orm::{
+    ConnectionTrait, Database, DatabaseConnection, DatabaseConnectionType, query::Statement,
+};
 use tokio::net::TcpListener;
 use tokio::sync::OnceCell;
 use tokio::time;
+use tokio_util::sync::CancellationToken;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::trace::TraceLayer;
 
-use access::http::{apply_auth, AuthState};
+use access::http::{AuthState, apply_auth};
 use attic::cache::CacheName;
 use config::{Config, StorageConfig};
 use database::migration::{Migrator, MigratorTrait};
 use error::{ErrorKind, ServerError, ServerResult};
 use middleware::{init_request_state, restrict_host, set_visibility_header};
-use storage::{LocalBackend, S3Backend, StorageBackend};
+use storage::{LocalBackend, S3Backend, StorageBackendImpl};
 
 type State = Arc<StateInner>;
 type RequestState = Arc<RequestStateInner>;
@@ -66,7 +68,7 @@ pub struct StateInner {
     database: OnceCell<DatabaseConnection>,
 
     /// Handle to the storage backend.
-    storage: OnceCell<Arc<Box<dyn StorageBackend>>>,
+    storage: OnceCell<Arc<StorageBackendImpl>>,
 }
 
 /// Request state.
@@ -110,7 +112,9 @@ impl StateInner {
                 let db = Database::connect(&self.config.database.url)
                     .await
                     .map_err(ServerError::database_error);
-                if let Ok(DatabaseConnection::SqlxSqlitePoolConnection(ref conn)) = db {
+                if let Ok(db_conn) = &db
+                    && let DatabaseConnectionType::SqlxSqlitePoolConnection(conn) = &db_conn.inner
+                {
                     // execute some sqlite-specific performance optimizations
                     // see https://phiresky.github.io/blog/2020/sqlite-performance-tuning/ for
                     // more details
@@ -134,19 +138,17 @@ impl StateInner {
     }
 
     /// Returns a handle to the storage backend.
-    async fn storage(&self) -> ServerResult<&Arc<Box<dyn StorageBackend>>> {
+    async fn storage(&self) -> ServerResult<&Arc<StorageBackendImpl>> {
         self.storage
             .get_or_try_init(|| async {
                 match &self.config.storage {
                     StorageConfig::Local(local_config) => {
                         let local = LocalBackend::new(local_config.clone()).await?;
-                        let boxed: Box<dyn StorageBackend> = Box::new(local);
-                        Ok(Arc::new(boxed))
+                        Ok(Arc::new(local.into()))
                     }
                     StorageConfig::S3(s3_config) => {
                         let s3 = S3Backend::new(s3_config.clone()).await?;
-                        let boxed: Box<dyn StorageBackend> = Box::new(s3);
-                        Ok(Arc::new(boxed))
+                        Ok(Arc::new(s3.into()))
                     }
                 }
             })
@@ -160,7 +162,7 @@ impl StateInner {
             Statement::from_string(db.get_database_backend(), "SELECT 'heartbeat';".to_string());
 
         loop {
-            let _ = db.execute(stmt.clone()).await;
+            let _ = db.execute_raw(stmt.clone()).await;
             time::sleep(Duration::from_secs(60)).await;
         }
     }
@@ -216,8 +218,12 @@ async fn fallback(_: Uri) -> ServerResult<()> {
     Err(ErrorKind::NotFound.into())
 }
 
-/// Runs the API server.
-pub async fn run_api_server(cli_listen: Option<SocketAddr>, config: Config) -> Result<()> {
+/// Runs the API server until shutdown is requested.
+pub async fn run_api_server(
+    cli_listen: Option<SocketAddr>,
+    config: Config,
+    shutdown: CancellationToken,
+) -> Result<()> {
     eprintln!("Starting API server...");
 
     let state = StateInner::new(config).await;
@@ -244,13 +250,27 @@ pub async fn run_api_server(cli_listen: Option<SocketAddr>, config: Config) -> R
 
     let listener = TcpListener::bind(&listen).await?;
 
-    let (server_ret, _) = tokio::join!(axum::serve(listener, rest).into_future(), async {
-        if state.config.database.heartbeat {
-            let _ = state.run_db_heartbeat().await;
-        }
-    },);
+    let server = axum::serve(listener, rest);
 
-    server_ret?;
+    let heartbeat_handle = if state.config.database.heartbeat {
+        let state_clone = state.clone();
+        Some(tokio::spawn(async move {
+            let _ = state_clone.run_db_heartbeat().await;
+        }))
+    } else {
+        None
+    };
+
+    let server_result = server
+        .with_graceful_shutdown(shutdown.cancelled_owned())
+        .await;
+
+    if let Some(handle) = heartbeat_handle {
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    server_result?;
 
     Ok(())
 }
