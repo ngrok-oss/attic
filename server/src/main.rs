@@ -144,7 +144,22 @@ fn run_shutdown_handler() -> CancellationToken {
 
 fn init_logging(tokio_console: bool) {
     let env_filter = EnvFilter::from_default_env();
-    let fmt_layer = tracing_subscriber::fmt::layer().with_filter(env_filter);
+
+    // Log collectors need structured output to read levels and fields.
+    let json = env::var("ATTIC_LOG_FORMAT").is_ok_and(|v| v.eq_ignore_ascii_case("json"));
+    let fmt_layer = if json {
+        tracing_subscriber::fmt::layer()
+            .json()
+            .flatten_event(true)
+            .with_current_span(true)
+            .with_span_list(false)
+            .with_filter(env_filter)
+            .boxed()
+    } else {
+        tracing_subscriber::fmt::layer()
+            .with_filter(env_filter)
+            .boxed()
+    };
 
     let error_layer = ErrorLayer::default();
 
